@@ -17,8 +17,10 @@ limitations under the License.
 package collectors
 
 import (
+	"math"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
@@ -66,6 +68,18 @@ var (
 		"kube_pod_created",
 		"Unix creation timestamp",
 		[]string{"namespace", "pod"}, nil,
+	)
+
+	descPodTimeToSchedule = prometheus.NewDesc(
+		"kube_pod_time_to_schedule",
+		"Time to schedule in seconds.",
+		[]string{"namespace", "pod", "scheduled"}, nil,
+	)
+
+	descPodTimeToStart = prometheus.NewDesc(
+		"kube_pod_time_to_start",
+		"Time from pod object creation to being recognized by the Kubelet in seconds.",
+		[]string{"namespace", "pod", "started"}, nil,
 	)
 
 	descPodStatusPhase = prometheus.NewDesc(
@@ -210,6 +224,8 @@ func (pc *podCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descPodOwner
 	ch <- descPodLabels
 	ch <- descPodCreated
+	ch <- descPodTimeToSchedule
+	ch <- descPodTimeToStart
 	ch <- descPodStatusPhase
 	ch <- descPodStatusReady
 	ch <- descPodStatusScheduled
@@ -296,8 +312,10 @@ func (pc *podCollector) collectPod(ch chan<- prometheus.Metric, p v1.Pod) {
 		}
 	}
 
+	var startTime float64
 	if p.Status.StartTime != nil {
-		addGauge(descPodStartTime, float64((*(p.Status.StartTime)).Unix()))
+		startTime = float64((*(p.Status.StartTime)).Unix())
+		addGauge(descPodStartTime, startTime)
 	}
 
 	addGauge(descPodInfo, 1, p.Status.HostIP, p.Status.PodIP, nodeName, createdByKind, createdByName)
@@ -326,8 +344,32 @@ func (pc *podCollector) collectPod(ch chan<- prometheus.Metric, p v1.Pod) {
 		addGauge(descPodStatusPhase, boolFloat64(p == v1.PodUnknown), string(v1.PodUnknown))
 	}
 
+	var creationTime float64
 	if !p.CreationTimestamp.IsZero() {
-		addGauge(descPodCreated, float64(p.CreationTimestamp.Unix()))
+		creationTime = float64(p.CreationTimestamp.Unix())
+		addGauge(descPodCreated, creationTime)
+	}
+
+	var timeToStart float64
+	if startTime > 0 && creationTime > 0 {
+		timeToStart = startTime - creationTime
+	} else if creationTime > 0 {
+		timeToStart = float64(time.Now().Unix()) -  creationTime
+	}
+	if timeToStart < 0 {
+		timeToStart = 0
+	}
+	hasStarted := strconv.FormatBool(p.Status.Phase != v1.PodPending && p.Status.Phase != v1.PodUnknown)
+	addGauge(descPodTimeToStart, timeToStart, hasStarted)
+
+	// Find the most correct start time for the Pod based on event ordering
+	var adjustedPodStartTime float64
+	if startTime > 0 && creationTime > 0 {
+		adjustedPodStartTime = math.Min(startTime, creationTime)
+	} else if creationTime > 0 {
+		adjustedPodStartTime = creationTime
+	} else {
+		adjustedPodStartTime = startTime
 	}
 
 	for _, c := range p.Status.Conditions {
@@ -336,6 +378,21 @@ func (pc *podCollector) collectPod(ch chan<- prometheus.Metric, p v1.Pod) {
 			addConditionMetrics(ch, descPodStatusReady, c.Status, p.Namespace, p.Name)
 		case v1.PodScheduled:
 			addConditionMetrics(ch, descPodStatusScheduled, c.Status, p.Namespace, p.Name)
+
+			var timeToSchedule float64
+			var isScheduled string
+			if c.Status == v1.ConditionTrue && adjustedPodStartTime > 0 {
+				timeToSchedule = float64(c.LastTransitionTime.Unix()) - adjustedPodStartTime
+				isScheduled = "true"
+			} else if c.Status == v1.ConditionFalse {
+				timeToSchedule = float64(time.Now().Unix()) - adjustedPodStartTime
+				isScheduled = "false"
+				addGauge(descPodTimeToSchedule, timeToSchedule, "false")
+			}
+			if timeToSchedule < 0 {
+				timeToSchedule = 0
+			}
+			addGauge(descPodTimeToSchedule, timeToSchedule, isScheduled)
 		}
 	}
 
